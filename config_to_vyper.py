@@ -64,9 +64,9 @@ class MetaFuse:
         return pp.CRS.from_proj4(proj_string)
 
     @staticmethod
-    def geographic_to_utm(geographic_crs: pp.CRS,
-                          zone_number: int,
-                          southern_hemisphere=False) -> pp.CRS:
+    def geographic_to_utm_by_db(geographic_crs: pp.CRS,
+                                zone_number: int,
+                                southern_hemisphere=False) -> pp.CRS:
         """
         Convert a geographic CRS to a UTM CRS using the specified zone number.
         """
@@ -83,6 +83,56 @@ class MetaFuse:
                          f" {zone_number}{hemi} not found in the database")
             return None
         return pp.CRS(f"{df.iloc[0].auth_name}:{df.iloc[0].code}")
+
+    @staticmethod
+    def geographic_to_utm(zone_number: int) -> pp.CRS:
+        """
+        Convert a geographic CRS to a UTM CRS using the specified zone number.
+        Only for NAD83 2011.
+        """
+        def nad83_to_utm(zone_number: int) -> pp.CRS:
+            """
+            Construct a projected UTM CRS based on NAD83 and
+            the specified zone number.
+            """
+            utm_code = f"EPSG:{26900 + zone_number}"
+            if zone_number == 59:
+                utm_code = "EPSG:3372"
+            elif zone_number == 60:
+                utm_code = "EPSG:3373"
+            return pp.CRS(utm_code), utm_code
+
+        def nad83_2011_to_utm(zone_number: int) -> pp.CRS:
+            """
+            Construct a projected UTM CRS based on NAD83 2011 and
+            the specified zone number.
+            """
+            utm_code = f"EPSG:{6329 + zone_number}"
+            if zone_number == 59:
+                utm_code = "EPSG:6328"
+            elif zone_number == 60:
+                utm_code = "EPSG:6329"
+            return pp.CRS(utm_code), utm_code
+
+        zone_number = int(zone_number)
+        if zone_number in [54, 55, 58]:
+            if zone_number == 54:
+                utm_code = "EPSG:8692"
+            elif zone_number == 55:
+                utm_code = "EPSG:8693"
+            elif zone_number == 58:
+                utm_code = "ESRI:102213"
+            pro_crs = pp.CRS(utm_code)
+        else:
+            pro_crs, utm_code = nad83_2011_to_utm(zone_number)
+            if not pro_crs.utm_zone:
+                pro_crs, utm_code = nad83_to_utm(zone_number)
+
+        if not pro_crs.utm_zone:
+            LOGGER.error(f"UTM CRS for zone {zone_number} and "
+                         f"auth_code: {utm_code} not found")
+            return None
+        return pro_crs
 
     def get_horiz_crs(self, prefix: str, section: str = "Default") -> Optional[pp.CRS]:
         """
@@ -108,16 +158,17 @@ class MetaFuse:
         # h_datum = self.config.get(section, f"{prefix}_horiz_datum")
         h_frame = self.config.get(section, f"{prefix}_horiz_frame")
         h_type = self.config.get(section, f"{prefix}_horiz_type")
-        # h_units = self.config.get(section, f"{prefix}_horiz_units") # UTM alwas is in m
+        # h_units = self.config.get(section, f"{prefix}_horiz_units") # UTM always is in m
         h_key = self.config.get(section, f"{prefix}_horiz_key")
 
         try:
             # h_frame = "NAD83_2011"
             h_crs = pp.CRS(h_frame)
             if h_key and h_type and h_type.lower() == "utm":
-                h_crs = self.geographic_to_utm(geographic_crs=h_crs,
+                h_crs = self.geographic_to_utm(#geographic_crs=h_crs,
                                                zone_number=h_key,
-                                               southern_hemisphere=False)
+                                               #southern_hemisphere=False
+                                               )
         except pp.exceptions.CRSError as e:
             LOGGER.error(f"Error creating CRS from {h_frame}: {e}")
             return None
@@ -211,6 +262,8 @@ for f in files:
     if f.find("enc_pbc_northeast_utm19n_mld_enc.config") != -1 or f.find("Unused") != -1:
         continue
     mf = MetaFuse(f)
-    print(mf.get_config("Default", "to_horiz_frame"))
+    # print(mf.get_config("Default", "to_horiz_frame"))
+    print(mf.get_config("Default", "to_horiz_key"))
     print(mf.get_horiz_crs("to", "Default").to_authority())
     print(mf.get_vertical_crs("to", "Default").to_authority())
+    print("-----------")
