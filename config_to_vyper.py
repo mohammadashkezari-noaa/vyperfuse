@@ -1,17 +1,20 @@
 import logging
-from typing import Optional, Literal
+from typing import Optional, Literal, Union
 import configparser
 import pyproj as pp
 from vyperdatum.db import DB
 
 LOGGER = logging.getLogger("fuse.tran")
 
-class MetaFuse:
+class FuseConfig:
     def __init__(self, config_file):
+        self.ELLIPSOID = "ellipsoid"
+        self.ELLIPSOID_AUTH_CODE = "ELL_AUTH_CODE"
         self.config_file = config_file
         self.config = configparser.ConfigParser()
         self.config.read(self.config_file)
         self.tblVCRS = {
+                        self.ELLIPSOID: {"height(m)": self.ELLIPSOID_AUTH_CODE},
                         "navd88": {"height(m)": "EPSG:5703",
                                    "depth(m)": "EPSG:6357",
                                    "height(ftus)": "EPSG:6360",
@@ -85,10 +88,40 @@ class MetaFuse:
         return pp.CRS(f"{df.iloc[0].auth_name}:{df.iloc[0].code}")
 
     @staticmethod
+    def geographic_to_spc(fips_code: int,
+                          units: Literal["m", "ft", "us_ft"]) -> pp.CRS:
+        """
+        Convert a geographic CRS to a State Place CRS using the
+        specified FIPS code.
+        """
+        def sql(fips_code, units, geodetic_code):
+            return (f"select * from projected_crs where deprecated=0"
+                    f" and name like '%{fips_code}{units}'"
+                    f" and geodetic_crs_code={geodetic_code}")
+
+        assert (units in ["m", "ft", "us_ft"]
+                ), f"Units must be 'm', 'ft', 'us_ft', not '{units}'"
+        if units == "m":
+            units = ""
+        elif units == "ft":
+            units = "_Feet"
+        elif units == "us_ft":
+            units = "_Ft_US"
+        fips_code = int(fips_code)
+        geodetic_code = 6318
+        df = DB().query(sql(fips_code, units, geodetic_code), dataframe=True)
+        if len(df) != 1:
+            LOGGER.error(f"State Plane CRS for FIPS {fips_code} in {units}"
+                         f" and based on geodetic CRS EPSG:{geodetic_code} "
+                         "not found in the database")
+            return None
+        return pp.CRS(f"{df.iloc[0].auth_name}:{df.iloc[0].code}")
+
+    @staticmethod
     def geographic_to_utm(zone_number: int) -> pp.CRS:
         """
         Convert a geographic CRS to a UTM CRS using the specified zone number.
-        Only for NAD83 2011.
+        Only for NAD83 2011 based projected CRS with units in m.
         """
         def nad83_to_utm(zone_number: int) -> pp.CRS:
             """
@@ -115,6 +148,10 @@ class MetaFuse:
             return pp.CRS(utm_code), utm_code
 
         zone_number = int(zone_number)
+        if zone_number > 60 or zone_number < 0:
+            msg = f"UTM zone number {zone_number} is out of range"
+            LOGGER.error(msg)
+            raise ValueError(msg)
         if zone_number in [54, 55, 58]:
             if zone_number == 54:
                 utm_code = "EPSG:8692"
@@ -129,9 +166,10 @@ class MetaFuse:
                 pro_crs, utm_code = nad83_to_utm(zone_number)
 
         if not pro_crs.utm_zone:
-            LOGGER.error(f"UTM CRS for zone {zone_number} and "
-                         f"auth_code: {utm_code} not found")
-            return None
+            msg = (f"UTM CRS for zone {zone_number} and "
+                   f"auth_code: {utm_code} not found")
+            LOGGER.error(msg)
+            raise ValueError(msg)
         return pro_crs
 
     def get_horiz_crs(self, prefix: str, section: str = "Default") -> Optional[pp.CRS]:
@@ -155,29 +193,39 @@ class MetaFuse:
                 ), f"Prefix must be 'from' or 'to', not '{prefix}'"
         assert (section in self.config.sections()
                 ), f"Section '{section}' not found in the configuration file"
-        # h_datum = self.config.get(section, f"{prefix}_horiz_datum")
-        h_frame = self.config.get(section, f"{prefix}_horiz_frame")
-        h_type = self.config.get(section, f"{prefix}_horiz_type")
-        # h_units = self.config.get(section, f"{prefix}_horiz_units") # UTM always is in m
-        h_key = self.config.get(section, f"{prefix}_horiz_key")
-
         try:
-            # h_frame = "NAD83_2011"
+            h_datum = self.config.get(section, f"{prefix}_horiz_datum")
+            h_frame = self.config.get(section, f"{prefix}_horiz_frame")
+            h_type = self.config.get(section, f"{prefix}_horiz_type")
+            h_units = self.config.get(section, f"{prefix}_horiz_units")
+            h_key = self.config.get(section, f"{prefix}_horiz_key")
+        except configparser.NoOptionError as e:
+            msg = (f"Missing CRS parameter in config file: "
+                   f"{self.config_file}; {e}")
+            LOGGER.error(msg)
+            raise ValueError(msg)
+            return None  # This line is unreachable but kept for clarity
+        if not all([h_datum, h_frame, h_units, h_key]):
+            msg = (f"Missing required parameters for {prefix}_horizontal"
+                   f" CRS in file: {self.config_file}")
+            LOGGER.error(msg)
+            raise ValueError(msg)
+        try:
             h_crs = pp.CRS(h_frame)
-            if h_key and h_type and h_type.lower() == "utm":
-                h_crs = self.geographic_to_utm(#geographic_crs=h_crs,
-                                               zone_number=h_key,
-                                               #southern_hemisphere=False
-                                               )
+            if h_type.lower() == "utm":
+                # UTM always in m
+                h_crs = self.geographic_to_utm(zone_number=h_key)
+            elif h_type.lower() == "spc":
+                h_crs = self.geographic_to_spc(fips_code=h_key, units=h_units)
         except pp.exceptions.CRSError as e:
-            LOGGER.error(f"Error creating CRS from {h_frame}: {e}")
-            return None
+            LOGGER.error(f"Error creating CRS from {h_frame}, "
+                         f"in file: {self.config_file}.\nError message: {e}")
         return h_crs
 
     def get_vertical_crs(self,
                          prefix: Literal["form", "to"],
                          section: str = "Default"
-                         ) -> Optional[pp.CRS]:
+                         ) -> Optional[Union[pp.CRS, str]]:
         """
         Construct a pyproj vertical CRS object using the CRS info
         at the config file.
@@ -193,25 +241,62 @@ class MetaFuse:
         ----------
         pyproj.CRS
             Returns a pyproj CRS object.
+            For Ellipsoid-based vertical CRS, returns string `self.ELLIPSOID_AUTH_CODE`.
+            Returns None if the vertical CRS cannot be constructed.
         """
         assert (prefix in ["from", "to"]
                 ), f"Prefix must be 'from' or 'to', not '{prefix}'"
         assert (section in self.config.sections()
                 ), f"Section '{section}' not found in the configuration file"
-        v_key = self.config.get(section, f"{prefix}_vert_key")
-        v_units = self.config.get(section, f"{prefix}_vert_units")
-        v_direction = self.config.get(section, f"{prefix}_vert_direction")
         try:
-            v_crs = pp.CRS(self.vertical_crs_look_up(v_key, v_direction, v_units))
+            v_key = self.config.get(section, f"{prefix}_vert_key")
+            v_units = self.config.get(section, f"{prefix}_vert_units")
+            v_direction = self.config.get(section, f"{prefix}_vert_direction")
+        except configparser.NoOptionError as e:
+            msg = (f"Missing CRS parameter in config file: "
+                   f"{self.config_file}; {e}")
+            LOGGER.error(msg)
+
+            return None  # This line is unreachable but kept for clarity
+        if not all([v_key, v_units, v_direction]):
+            msg = (f"Missing required parameters for {prefix}_vertical"
+                   f" CRS in file: {self.config_file}")
+            LOGGER.error(msg)
+            raise ValueError(msg)
+        try:
+            v_auth_code = self.vertical_crs_look_up(v_key,
+                                                    v_direction,
+                                                    v_units)
+            if v_auth_code == self.ELLIPSOID_AUTH_CODE:
+                v_crs = self.ELLIPSOID_AUTH_CODE
+            else:
+                v_crs = pp.CRS(v_auth_code)
         except pp.exceptions.CRSError as e:
-            LOGGER.error("Error creating vertical CRS from"
-                         f" {v_key}, {v_direction}, {v_units}: {e}")
+            msg = (f"Error creating vertical CRS from {v_key}, {v_direction},"
+                   f"  {v_units} in file: {self.config_file}. The generated "
+                   f"auth:code is {v_auth_code}. \nPypoj error message: {e}")
+            LOGGER.error(msg)
             return None
         return v_crs
 
+    def ellipsoid_key(self, v_datum: str) -> str:
+        """
+        Return the ellipsoid datum name that the vertical datum
+        refers to the Ellipsoid. Otherwise, return the input
+        vertical datum name.
+        """
+        ell = ("NAD27, NAD83_1986, NAD83_2011, NAD83_NSRS2007, NAD83_MARP00,"
+               "NAD83_PACP00, WGS84_G1674, ITRF2014, IGS14, ITRF2008, IGS08,"
+               "ITRF2005, IGS2005, WGS84_G1150, ITRF2000, IGS00, IGb00,"
+               "WGS84_G873, ITRF94, ITRF93, ITRF92, SIOMIT92, WGS84_G730,"
+               "ITRF91, ITRF90, ITRF89, ITRF88, ITRF96, WGS84_TRANSIT,"
+               "WGS84_G1762")
+        ell = [e.strip() for e in ell.split(",")]
+        return v_datum if v_datum.upper() not in ell else self.ELLIPSOID
+
     def vertical_crs_look_up(self, v_datum: str,
                              direction: Literal["height", "depth"],
-                             units: Literal["m", "ft"]
+                             units: Literal["m", "ftUS"]
                              ) -> Optional[str]:
         """
         Return 'Authority:Code' representation of a registered vertical CRS
@@ -241,29 +326,82 @@ class MetaFuse:
                 ), f"Direction must be 'height' or 'depth', not '{direction}'"
         assert (units in ["m", "ftUS"]
                 ), f"Units must be 'm' or 'ftUS', not '{units}'"
+        v_datum = self.ellipsoid_key(v_datum)
         v_datum = v_datum.lower()
         direction = direction.lower()
         units = units.lower()
         ac = self.tblVCRS.get(v_datum, {}).get(f"{direction}({units})")
         if not ac:
-            LOGGER.error(f"Unknown vertical datum '{v_datum}' with direction '{direction}' and units '{units}'")
+            LOGGER.error(f"Unknown vertical datum '{v_datum}' with "
+                         f"direction '{direction}' and units '{units}'")
             return None
         return ac
+
+
+def get_crs_from_fuse_config(config_file: str) -> dict:
+    """
+    Extract the source and target CRS from the provided configuration file.
+
+    Parameters
+    ----------
+    config_file: str
+        Path to the configuration file.
+
+    Returns
+    -------
+    Dict
+        A dictionary containing the source and target CRS information.
+        example: {'from': 'EPSG:6347+EPSG:5703', 'to': 'EPSG:6347+NOAA:98'}
+    """
+    def validate_crs(auth_code: str) -> Optional[str]:
+        """
+        Validate if the CRS is a valid pyproj CRS.
+        """
+        try:
+            INVALID = None
+            invalid_msg = ("The constructed CRS authority code in "
+                           f"{config_file} is: '{auth_code}',"
+                           " which is invalid.")
+            if not auth_code or not pp.CRS(auth_code):
+                LOGGER.error(invalid_msg)
+                raise ValueError(invalid_msg)
+                return INVALID  # This line is unreachable but kept for clarity
+            return auth_code
+        except pp.exceptions.CRSError as e:
+            LOGGER.error(f"{invalid_msg}\nInvalid CRS: {e}")
+            return INVALID
+
+    fc = FuseConfig(config_file)
+
+    # from_h = validate_crs(":".join(fc.get_horiz_crs("from", "Default").to_authority()))
+    # from_vcrs = fc.get_vertical_crs("from", "Default")
+    # if isinstance(from_vcrs, str) and from_vcrs == fc.ELLIPSOID_AUTH_CODE:
+    #     from_crs = from_h
+    # else:
+    #     from_crs = from_h + "+" + validate_crs(":".join(from_vcrs.to_authority()))
+
+    to_h = validate_crs(":".join(fc.get_horiz_crs("to", "Default").to_authority()))
+    to_vcrs = fc.get_vertical_crs("to", "Default")
+    if isinstance(to_vcrs, str) and to_vcrs == fc.ELLIPSOID_AUTH_CODE:
+        to_crs = to_h
+    else:
+        to_crs = to_h + "+" + validate_crs(":".join(to_vcrs.to_authority()))
+
+    crs_dict = {
+        # "from": from_crs,
+        "to": to_crs
+    }
+    return crs_dict
+
 
 
 
 
 from glob import glob
-
 files = glob("./Updated_Configs/**/*.config")
-print(files)
 for f in files:
-    print(f)
+    # print(f)
     if f.find("enc_pbc_northeast_utm19n_mld_enc.config") != -1 or f.find("Unused") != -1:
         continue
-    mf = MetaFuse(f)
-    # print(mf.get_config("Default", "to_horiz_frame"))
-    print(mf.get_config("Default", "to_horiz_key"))
-    print(mf.get_horiz_crs("to", "Default").to_authority())
-    print(mf.get_vertical_crs("to", "Default").to_authority())
-    print("-----------")
+    crs_dict = get_crs_from_fuse_config(f)
+    print(crs_dict)
